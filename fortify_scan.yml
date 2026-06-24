@@ -98,7 +98,7 @@
       $projectName = $env:CI_PROJECT_NAME.ToLower() -replace '[^a-z0-9-]', '-'
 
       # Sanitize the branch name the same way.
-      # Example: "Feature/Fortify-BlackDuck" → "feature-fortify-blackduck"
+      # Example: "Feature/Fortify-SCA" → "feature-fortify-sca"
       $branchName = $env:CI_COMMIT_REF_NAME.ToLower() -replace '[^a-z0-9-]', '-'
 
       # App name in SSC = project name only.
@@ -300,9 +300,7 @@
         # We use fortifyclient.bat instead of the REST API for the upload.
         # FPR files are binary ZIP archives — fortifyclient handles the
         # multipart upload correctly. The REST API /fileTokens + /upload
-        # approach is fragile and often fails with large FPR files.
-        # Uploading by -projectVersionID (numeric ID) is more reliable than
-        # uploading by name, which can fail if SSC finds multiple matches.
+        # approach is fragile and often fails with large FPR files
         Write-Host "========================================" -ForegroundColor Cyan
         Write-Host "Uploading FPR to SSC..."                 -ForegroundColor Cyan
         Write-Host "Version ID : $versionId"                 -ForegroundColor Cyan
