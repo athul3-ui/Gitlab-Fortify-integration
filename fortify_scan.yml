@@ -97,7 +97,7 @@
       $projectName = $env:CI_PROJECT_NAME.ToLower() -replace '[^a-z0-9-]', '-'
 
       # Sanitize the branch name the same way.
-      # Example: "Feature/Fortify-BlackDuck" → "feature-fortify-blackduck"
+      # Example: "Feature/Fortify-SCA" → "feature-sca"
       $branchName = $env:CI_COMMIT_REF_NAME.ToLower() -replace '[^a-z0-9-]', '-'
 
       # Combine project and branch into a unique SSC application name.
@@ -309,7 +309,7 @@
           -url $env:FORTIFY_SSC_URL `
           -authtoken $env:FORTIFY_TOKEN `
           -file $fprFile `
-          -projectVersionID $versionId   # Use numeric ID — avoids name ambiguity in SSC
+          -projectVersionID $versionId   
 
         # $LASTEXITCODE captures the exit code of the last native command (bat/exe).
         # A non-zero code from fortifyclient means the upload failed.
