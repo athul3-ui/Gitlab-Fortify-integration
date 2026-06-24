@@ -1,12 +1,12 @@
 # fortify-sast-gitlab-ci
 
-A GitLab CI/CD pipeline job that runs a full Fortify SAST scan and uploads results to Fortify SSC automatically — handling app and version creation in SSC dynamically, so you never have to set anything up manually in the SSC UI.
+A GitLab CI/CD pipeline job that runs a full Fortify SAST scan and uploads results to Fortify SSC automatically handling app and version creation in SSC dynamically, so you never have to set anything up manually in the SSC UI.
 
 ---
 
 ## What problem this solves
 
-Getting Fortify integrated into a CI/CD pipeline sounds simple until you hit the SSC side of things. The scan itself is straightforward, but uploading results requires a valid SSC version ID — which means you either pre-create every application and version in SSC by hand (tedious at scale), or you automate it. This script does the latter.
+Getting Fortify integrated into a CI/CD pipeline sounds simple until you hit the SSC side of things. The scan itself is straightforward, but uploading results requires a valid SSC version ID, which means you either pre-create every application and version in SSC by hand (tedious at scale), or you automate it. This script does the latter.
 
 Every time the pipeline runs, it checks whether the application and version already exist in SSC. If they do, it reuses them. If they don't, it creates them and uploads. No manual SSC setup, no hardcoded version IDs, no pipeline failures because someone forgot to create a version before merging a new branch.
 
