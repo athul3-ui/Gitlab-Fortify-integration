@@ -1,0 +1,346 @@
+# ─────────────────────────────────────────────────────────────────────────────
+# fortify_scan.yml — Fortify SAST Scan Stage for GitLab CI/CD
+# ─────────────────────────────────────────────────────────────────────────────
+#
+# What this does:
+#   Runs a complete Fortify Static Application Security Testing (SAST) scan
+#   as part of your GitLab CI/CD pipeline and uploads results to Fortify SSC
+#   (Software Security Center) automatically — no manual steps required.
+#
+#   The scan runs in four logical phases:
+#     1. Clean  — wipe leftover artifacts from previous runs
+#     2. Translate — parse your source code into Fortify's intermediate format
+#     3. Scan   — run the static analysis and produce an FPR results file
+#     4. Upload — push the FPR to SSC, creating the app/version if it doesn't exist yet
+#
+# How to use this in your pipeline:
+#   This file defines a reusable base job (.fortify_scan_base) using GitLab's
+#   YAML anchor/extends pattern. In your main .gitlab-ci.yml, extend it like:
+#
+#     include:
+#       - local: fortify_scan.yml
+#
+#     fortify_scan:
+#       extends: .fortify_scan_base
+#       only:
+#         - main
+#         - develop
+#
+# Runner requirements:
+#   - A GitLab runner tagged 'fortify-slave-1' running on Windows
+#   - Fortify SCA (sourceanalyzer.exe) installed on the runner
+#   - OpenText/Micro Focus Fortify 26.2.0 at the path defined in FORTIFY_HOME
+#   - PowerShell available on the runner (standard on Windows)
+#   - Network access from the runner to your SSC server
+#
+# Required GitLab CI/CD Variables (set in Settings → CI/CD → Variables):
+#   FORTIFY_SSC_URL   — Full URL to your SSC server (e.g. https://ssc.yourcompany.com/ssc)
+#   FORTIFY_TOKEN     — SSC authentication token (generate in SSC under Administration → Tokens)
+#
+# App naming convention in SSC:
+#   App Name    →  {project-name}-{branch-name}   e.g. "payment-service-main"
+#   App Version →  {branch-name}                  e.g. "main", "feature-login-fix"
+#
+#   This keeps each project's branches as separate versions under the same SSC
+#   application, so triage history carries across branches.
+#
+# Adapting for GitHub Actions:
+#   See README.md for a full GitHub Actions equivalent using self-hosted runners.
+#   The core script block is identical — only the variable names change:
+#     CI_PROJECT_NAME      →  github.event.repository.name
+#     CI_COMMIT_REF_NAME   →  github.ref_name
+#   And variables are referenced as ${{ secrets.FORTIFY_SSC_URL }} instead of $env:
+# ─────────────────────────────────────────────────────────────────────────────
+
+# The leading dot makes this a "hidden job" in GitLab CI — it won't run on its own.
+# Other jobs extend it using `extends: .fortify_scan_base`.
+# This pattern is useful when you want to reuse the same scan logic across
+# multiple jobs (e.g. different environments or trigger conditions).
+.fortify_scan_base:
+  stage: scan
+
+  tags:
+    # This job must run on a runner tagged 'fortify-slave-1'.
+    # Fortify SCA is a licensed tool installed on specific machines —
+    # the tag ensures the job only picks up on a runner where it's available.
+    # Change this to match whatever tag your Fortify runner is registered with.
+    - fortify-slave-1
+
+  script:
+    - |
+      # ── Environment Setup ─────────────────────────────────────────────────
+
+      # Force PowerShell to use TLS 1.2 for all HTTPS connections.
+      # SSC's REST API requires TLS 1.2 and older Windows runners may default
+      # to TLS 1.0/1.1, causing connection failures without this line.
+      [Net.ServicePointManager]::SecurityProtocol = [Net.SecurityProtocolType]::Tls12
+
+      # Set FORTIFY_HOME to the Fortify SCA installation directory.
+      # Update this path if you're on a different version or install location.
+      $env:FORTIFY_HOME = "C:\Program Files\Fortify\OpenText_SAST_Fortify_26.2.0"
+
+      # Add Fortify's bin directories to PATH so sourceanalyzer.exe and
+      # fortifyclient.bat can be called directly without full paths.
+      # Both directories are needed: bin for sourceanalyzer, Core\bin for fortifyclient.
+      $env:PATH = "$env:FORTIFY_HOME\bin;$env:FORTIFY_HOME\Core\bin;" + $env:PATH
+
+      # Store the full path to fortifyclient.bat separately — used in the upload step.
+      # fortifyclient handles FPR uploads and is more reliable than REST for binary files.
+      $fortifyClient = "$env:FORTIFY_HOME\bin\fortifyclient.bat"
+
+      # ── Build Identifiers ─────────────────────────────────────────────────
+
+      # Sanitize the GitLab project name for use as an SSC application name.
+      # Converts to lowercase and replaces anything that isn't a-z, 0-9, or hyphen
+      # with a hyphen. This avoids SSC rejecting names with spaces or special chars.
+      # Example: "Credit_Cards API" → "credit-cards-api"
+      $projectName = $env:CI_PROJECT_NAME.ToLower() -replace '[^a-z0-9-]', '-'
+
+      # Sanitize the branch name the same way.
+      # Example: "Feature/Fortify-BlackDuck" → "feature-fortify-blackduck"
+      $branchName = $env:CI_COMMIT_REF_NAME.ToLower() -replace '[^a-z0-9-]', '-'
+
+      # Combine project and branch into a unique SSC application name.
+      # Using both prevents collisions when the same branch name exists across projects.
+      # Example: "payment-service-main", "auth-service-develop"
+      $appName = "$projectName-$branchName"
+
+      # FPR filename uses the app name to avoid overwriting results from other branches
+      # if multiple branches run on the same runner simultaneously.
+      $fprFile = "$appName.fpr"
+
+      # Build the SSC REST API base URL. TrimEnd('/') prevents double slashes
+      # if someone sets FORTIFY_SSC_URL with a trailing slash in CI variables.
+      $sscBase = $env:FORTIFY_SSC_URL.TrimEnd('/') + "/api/v1"
+
+      # Issue template to apply when creating new applications/versions in SSC.
+      # "Prioritized-HighRisk-Project-Template" is the default Fortify template
+      # that prioritises Critical and High findings. Change this to match whatever
+      # template your SSC admin has configured for your organisation.
+      $templateId = "Prioritized-HighRisk-Project-Template"
+
+      # Print a summary of key values to the CI log for debugging.
+      # Useful when a scan fails and you need to verify what names were generated.
+      Write-Host "========================================" -ForegroundColor Cyan
+      Write-Host "App Name  : $appName"                    -ForegroundColor Cyan
+      Write-Host "Branch    : $branchName"                 -ForegroundColor Cyan
+      Write-Host "FPR File  : $fprFile"                    -ForegroundColor Cyan
+      Write-Host "SSC Base  : $sscBase"                    -ForegroundColor Cyan
+      Write-Host "========================================" -ForegroundColor Cyan
+
+      # Build the HTTP headers used for every SSC REST API call in this script.
+      # FortifyToken is SSC's authentication scheme — generate the token value
+      # in SSC under Administration → Token Management → UnifiedLoginToken.
+      $headers = @{
+        Authorization  = "FortifyToken $env:FORTIFY_TOKEN"
+        Accept         = "application/json"
+        "Content-Type" = "application/json"
+      }
+
+      # ══════════════════════════════════════════════════════════════════════
+      # STEP 1: Clean
+      # ══════════════════════════════════════════════════════════════════════
+      # Removes translation artifacts from any previous run with this build ID.
+      # Without a clean, old source files can bleed into the current scan,
+      # causing false positives or inflated finding counts.
+      Write-Host "Cleaning previous build cache..." -ForegroundColor Yellow
+      & sourceanalyzer.exe -b $appName -clean
+
+      # ══════════════════════════════════════════════════════════════════════
+      # STEP 2: Translate
+      # ══════════════════════════════════════════════════════════════════════
+      # Parses source code in the current directory (.) into Fortify's
+      # Normal Semantic Tree (NST) format. This is language-aware — Fortify
+      # will auto-detect Java, Python, JavaScript, C#, etc.
+      # The build ID ($appName) ties this translation to the scan in step 3.
+      # For large repos you can scope the path: replace '.' with 'src/' or similar.
+      Write-Host "Translating source code..." -ForegroundColor Yellow
+      & sourceanalyzer.exe -b $appName .
+
+      # ══════════════════════════════════════════════════════════════════════
+      # STEP 3: Scan
+      # ══════════════════════════════════════════════════════════════════════
+      # Runs Fortify's static analysis rules against the translated code.
+      # This is the slowest step — typically 5–30 minutes depending on codebase size.
+      # Output is a .fpr (Fortify Project Results) file containing all findings.
+      Write-Host "Running SAST scan..." -ForegroundColor Yellow
+      & sourceanalyzer.exe -b $appName -scan -f $fprFile
+
+      # Verify the FPR file was actually created.
+      # sourceanalyzer.exe can exit 0 even if the scan failed in some edge cases,
+      # so we check for the file explicitly rather than trusting the exit code alone.
+      if (!(Test-Path $fprFile)) {
+        Write-Host "ERROR: FPR file was not created. Scan may have failed silently." -ForegroundColor Red
+        exit 1
+      }
+      Write-Host "Scan completed. FPR created: $fprFile" -ForegroundColor Green
+
+      try {
+
+        # ══════════════════════════════════════════════════════════════════
+        # STEP 4: Check if this app version already exists in SSC
+        # ══════════════════════════════════════════════════════════════════
+        # Before uploading, we need a valid SSC version ID to upload to.
+        # We query SSC for existing versions matching our branch name, then
+        # narrow it down with an exact match on both app name and version name.
+        # The q= filter in SSC is fuzzy (partial match), so Where-Object
+        # provides the exact match guarantee we need.
+        Write-Host "Searching for existing application version in SSC..." -ForegroundColor Yellow
+
+        $verResp = Invoke-RestMethod `
+          -Uri "$sscBase/projectVersions?limit=200&q=name:`"$branchName`"" `
+          -Headers $headers `
+          -Method Get
+
+        $existing = $verResp.data | Where-Object {
+          $_.project.name -eq $appName -and $_.name -eq $branchName
+        }
+
+        if ($existing) {
+          # Version already exists — reuse it. This is the normal path for
+          # subsequent scans on the same branch (e.g. daily scans or PR scans).
+          $versionId = $existing.id
+          Write-Host "Found existing version (ID: $versionId) under app: $appName" -ForegroundColor Green
+
+        } else {
+          # ════════════════════════════════════════════════════════════════
+          # STEP 5: Version not found — check if the application exists
+          # ════════════════════════════════════════════════════════════════
+          # SSC organises scans as: Application → Version → Scan results.
+          # We need to know if the parent application already exists before
+          # deciding whether to create just a version or both app + version.
+          Write-Host "Version not found. Checking if application exists: $appName" -ForegroundColor Yellow
+
+          $appResp = Invoke-RestMethod `
+            -Uri "$sscBase/projects?limit=200&q=name:`"$appName`"" `
+            -Headers $headers `
+            -Method Get
+
+          $existingApp = $appResp.data | Where-Object { $_.name -eq $appName }
+
+          if ($existingApp) {
+            # ══════════════════════════════════════════════════════════════
+            # STEP 6A: Application exists — create new version only
+            # ══════════════════════════════════════════════════════════════
+            # The app is already in SSC (a previous branch was scanned).
+            # We just need to add a new version (this branch) under it.
+            # Linking by ID rather than name avoids issues with name changes.
+            Write-Host "Application exists (ID: $($existingApp.id)). Creating new version: $branchName" -ForegroundColor Yellow
+
+            $body = @{
+              name            = $branchName
+              project         = @{ id = $existingApp.id }  # Link to existing app by ID
+              active          = $true
+              committed       = $false    # Must start as false; committed separately below
+              issueTemplateId = $templateId
+            } | ConvertTo-Json -Depth 5
+
+          } else {
+            # ══════════════════════════════════════════════════════════════
+            # STEP 6B: Neither app nor version exists — create both
+            # ══════════════════════════════════════════════════════════════
+            # First scan for this project. SSC lets you create both the
+            # application and its first version in a single POST by nesting
+            # the project object inside the version creation request.
+            Write-Host "Application not found. Creating new app + version: $appName / $branchName" -ForegroundColor Yellow
+
+            $body = @{
+              name            = $branchName
+              project         = @{
+                name            = $appName     # New application name
+                issueTemplateId = $templateId  # Template applied to the application
+              }
+              active          = $true
+              committed       = $false
+              issueTemplateId = $templateId    # Template applied to the version
+            } | ConvertTo-Json -Depth 5
+          }
+
+          # ════════════════════════════════════════════════════════════════
+          # STEP 7: POST the version creation request
+          # ════════════════════════════════════════════════════════════════
+          # This covers both paths from 6A and 6B — the body differs but
+          # the endpoint is the same for both.
+          Write-Host "Sending version creation request to SSC..." -ForegroundColor Yellow
+
+          $verCreate = Invoke-RestMethod `
+            -Uri "$sscBase/projectVersions" `
+            -Headers $headers `
+            -Method Post `
+            -Body $body
+
+          $versionId = $verCreate.data.id
+          Write-Host "Version created (ID: $versionId)" -ForegroundColor Green
+
+          # ════════════════════════════════════════════════════════════════
+          # STEP 8: Commit the version
+          # ════════════════════════════════════════════════════════════════
+          # SSC requires a version to be "committed" before it can accept
+          # FPR uploads. A newly created version starts with committed=false.
+          # Without this PUT, the upload in step 9 will be rejected with a
+          # 400 error from SSC. This is a quirk of the SSC API.
+          Write-Host "Committing version (required before FPR upload)..." -ForegroundColor Yellow
+
+          Invoke-RestMethod `
+            -Uri "$sscBase/projectVersions/$versionId" `
+            -Headers $headers `
+            -Method Put `
+            -Body (@{ committed = $true } | ConvertTo-Json) | Out-Null
+
+          Write-Host "Version committed successfully." -ForegroundColor Green
+        }
+
+        # ══════════════════════════════════════════════════════════════════
+        # STEP 9: Upload FPR to SSC
+        # ══════════════════════════════════════════════════════════════════
+        # We use fortifyclient.bat instead of the REST API for the upload.
+        # FPR files are binary ZIP archives — fortifyclient handles the
+        # multipart upload correctly. The REST API /fileTokens + /upload
+        # approach is fragile and often fails with large FPR files.
+        # Uploading by -projectVersionID (numeric ID) is more reliable than
+        # uploading by name, which can fail if SSC finds multiple matches.
+        Write-Host "========================================" -ForegroundColor Cyan
+        Write-Host "Uploading FPR to SSC..."                 -ForegroundColor Cyan
+        Write-Host "Version ID : $versionId"                 -ForegroundColor Cyan
+        Write-Host "FPR File   : $fprFile"                   -ForegroundColor Cyan
+        Write-Host "========================================" -ForegroundColor Cyan
+
+        & $fortifyClient uploadFPR `
+          -url $env:FORTIFY_SSC_URL `
+          -authtoken $env:FORTIFY_TOKEN `
+          -file $fprFile `
+          -projectVersionID $versionId   # Use numeric ID — avoids name ambiguity in SSC
+
+        # $LASTEXITCODE captures the exit code of the last native command (bat/exe).
+        # A non-zero code from fortifyclient means the upload failed.
+        if ($LASTEXITCODE -ne 0) {
+          Write-Host "ERROR: fortifyclient upload failed (exit code: $LASTEXITCODE)" -ForegroundColor Red
+          exit 1
+        }
+
+        Write-Host "========================================" -ForegroundColor Green
+        Write-Host "Upload completed successfully!"           -ForegroundColor Green
+        Write-Host "App     : $appName"                      -ForegroundColor Green
+        Write-Host "Version : $branchName (ID: $versionId)"  -ForegroundColor Green
+        Write-Host "========================================" -ForegroundColor Green
+
+      } catch {
+        # Catch any REST API errors from Invoke-RestMethod.
+        # Print the full error and the SSC response body if available —
+        # SSC often returns a helpful error message in the response body
+        # that isn't visible in the default PowerShell error output.
+        Write-Host "FAILED: $_" -ForegroundColor Red
+        if ($_.Exception.Response) {
+          $reader = New-Object System.IO.StreamReader($_.Exception.Response.GetResponseStream())
+          Write-Host "SSC Response: $($reader.ReadToEnd())" -ForegroundColor Red
+        }
+        exit 1
+      }
+
+  artifacts:
+    paths:
+      # Save the FPR file so it can be downloaded from GitLab for manual review
+      # in Fortify Audit Workbench, or inspected if the SSC upload fails.
+      - "*.fpr"
+    expire_in: 1 week   # Auto-delete after 1 week to avoid consuming GitLab storage
+    when: on_success    # Only save the artifact if the job succeeded
